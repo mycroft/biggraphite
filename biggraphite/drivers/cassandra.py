@@ -27,6 +27,8 @@ import time
 from distutils import version
 from os import path as os_path
 
+import re
+
 import cassandra
 import prometheus_client
 import six
@@ -542,9 +544,6 @@ _COMPACTION_STRATEGY = "DateTieredCompactionStrategy"
 
 _COMPONENTS_MAX_LEN = common.COMPONENTS_MAX_LEN
 _LAST_COMPONENT = common.LAST_COMPONENT
-_METADATA_CREATION_CQL_PATH_COMPONENTS = ", ".join(
-    "component_%d text" % n for n in range(_COMPONENTS_MAX_LEN)
-)
 
 _METADATA_CREATION_CQL_METRICS_METADATA = str(
     'CREATE TABLE IF NOT EXISTS "%(keyspace)s".metrics_metadata ('
@@ -559,34 +558,25 @@ _METADATA_CREATION_CQL_METRICS_METADATA = str(
 )
 
 _METADATA_CREATION_CQL_METRICS_METADATA_CREATED_ON_INDEX = [
-    'CREATE CUSTOM INDEX IF NOT EXISTS ON "%%(keyspace)s".%(table)s (created_on)'
-    "  USING 'org.apache.cassandra.index.sasi.SASIIndex'"
-    "  WITH OPTIONS = {"
-    "    'mode': 'SPARSE'"
-    "  };" % {"table": "metrics_metadata"}
+    'CREATE INDEX IF NOT EXISTS ON "%%(keyspace)s".%(table)s (created_on);'
+    % {"table": "metrics_metadata"}
 ]
 
 _METADATA_CREATION_CQL_METRICS_METADATA_UPDATED_ON_INDEX = [
-    'CREATE CUSTOM INDEX IF NOT EXISTS ON "%%(keyspace)s".%(table)s (updated_on)'
-    "  USING 'org.apache.cassandra.index.sasi.SASIIndex'"
-    "  WITH OPTIONS = {"
-    "    'mode': 'SPARSE'"
-    "  };" % {"table": "metrics_metadata"}
+    'CREATE INDEX IF NOT EXISTS ON "%%(keyspace)s".%(table)s (updated_on);'
+    % {"table": "metrics_metadata"}
 ]
 
 _METADATA_CREATION_CQL_METRICS_METADATA_READ_ON_INDEX = [
-    'CREATE CUSTOM INDEX IF NOT EXISTS ON "%%(keyspace)s".%(table)s (read_on)'
-    "  USING 'org.apache.cassandra.index.sasi.SASIIndex'"
-    "  WITH OPTIONS = {"
-    "    'mode': 'SPARSE'"
-    "  };" % {"table": "metrics_metadata"}
+    'CREATE INDEX IF NOT EXISTS ON "%%(keyspace)s".%(table)s (read_on);'
+    % {"table": "metrics_metadata"}
 ]
 
 _METADATA_CREATION_CQL_METRICS = str(
     'CREATE TABLE IF NOT EXISTS "%(keyspace)s".metrics ('
     "  name text,"
     "  parent text,"
-    "  " + _METADATA_CREATION_CQL_PATH_COMPONENTS + ","
+    "  children set<text>, "
     "  PRIMARY KEY (name)"
     ");"
 )
@@ -594,17 +584,16 @@ _METADATA_CREATION_CQL_DIRECTORIES = str(
     'CREATE TABLE IF NOT EXISTS "%(keyspace)s".directories ('
     "  name text,"
     "  parent text,"
-    "  " + _METADATA_CREATION_CQL_PATH_COMPONENTS + ","
+    "  children set<text>, "
     "  PRIMARY KEY (name)"
     ");"
 )
+
 _METADATA_CREATION_CQL_ID_INDEXES = [
-    'CREATE CUSTOM INDEX IF NOT EXISTS ON "%%(keyspace)s".%(table)s (id)'
-    "  USING 'org.apache.cassandra.index.sasi.SASIIndex'"
-    "  WITH OPTIONS = {"
-    "    'mode': 'SPARSE'"
-    "  };" % {"table": "metrics_metadata"}
+    'CREATE INDEX IF NOT EXISTS ON "%%(keyspace)s".%(table)s (id);'
+    % {"table": "metrics_metadata"}
 ]
+
 _METADATA_CREATION_CQL = (
     [
         _METADATA_CREATION_CQL_METRICS,
@@ -1208,22 +1197,18 @@ class _CassandraAccessor(bg_accessor.Accessor):
             return statement
 
         # Metadata (metrics and directories)
-        components_names = ", ".join(
-            "component_%d" % n for n in range(_COMPONENTS_MAX_LEN)
-        )
-        components_marks = ", ".join("?" for n in range(_COMPONENTS_MAX_LEN))
         self.__insert_metric_statement = _CassandraExecutionRequest(
             INSERT_METRIC,
             __prepare(
-                'INSERT INTO "%s".metrics (name, parent, %s) VALUES (?, ?, %s);'
-                % (self.keyspace_metadata, components_names, components_marks)
+                'UPDATE "%s".metrics SET parent = ?, children = children + ? WHERE name = ?;'
+                % (self.keyspace_metadata)
             )
         )
         self.__insert_directory_statement = _CassandraExecutionRequest(
             INSERT_DIRECTORY,
             __prepare(
-                'INSERT INTO "%s".directories (name, parent, %s) VALUES (?, ?, %s) IF NOT EXISTS;'
-                % (self.keyspace_metadata, components_names, components_marks)
+                'UPDATE "%s".directories SET parent = ?, children = children + ? WHERE name = ?;'
+                % (self.keyspace_metadata)
             )
         )
         self.__insert_directory_statement.statement.serial_consistency_level = (
@@ -1246,6 +1231,15 @@ class _CassandraAccessor(bg_accessor.Accessor):
             'SELECT * FROM "%s".directories WHERE name = ?;' % self.keyspace_metadata,
             self._meta_read_consistency,
         )
+        self.__select_metric_statement_by_parent = __prepare(
+            'SELECT * FROM "%s".metrics WHERE parent = ?;' % self.keyspace_metadata,
+            self._meta_read_consistency,
+        )
+        self.__select_directory_statement_by_parent = __prepare(
+            'SELECT * FROM "%s".directories WHERE parent = ?;' % self.keyspace_metadata,
+            self._meta_read_consistency,
+        )
+
         self.__update_metric_metadata_statement = _CassandraExecutionRequest(
             UPDATE_METRIC_METADATA,
             __prepare(
@@ -1479,6 +1473,8 @@ class _CassandraAccessor(bg_accessor.Accessor):
         # otherwise creating each parent directory requires a round-trip and the
         # vast majority of metrics have siblings.
         parent_dir = metric.name.rpartition(".")[0]
+        metric_last_component = metric.name.rpartition(".")[2]
+
         if parent_dir and not self.has_directory(parent_dir):
             queries.extend(self._create_parent_dirs_queries(components))
 
@@ -1489,7 +1485,11 @@ class _CassandraAccessor(bg_accessor.Accessor):
         queries.append(
             (
                 self.__insert_metric_statement.with_param_list(
-                    [metric.name, parent_dir + "."] + components + padding
+                    [
+                        parent_dir,
+                        [metric_last_component],
+                        metric.name,
+                    ]
                 )
             )
         )
@@ -1549,13 +1549,31 @@ class _CassandraAccessor(bg_accessor.Accessor):
         for component in components[:-2]:
             path.append(component)
             name = DIRECTORY_SEPARATOR.join(path)
-            path_components = path + [_LAST_COMPONENT]
-            padding_len = _COMPONENTS_MAX_LEN - len(path_components)
-            padding = [c_query.UNSET_VALUE] * padding_len
+
+            print(parent, [components[len(path)]], name)
+
+            if len(path) == 1:
+                # root path: we add the root case
+                queries.append(
+                    (
+                        self.__insert_directory_statement.with_param_list(
+                            [
+                                '',
+                                [path[0]],
+                                '.',
+                            ]
+                        )
+                    )
+                )
+
             queries.append(
                 (
                     self.__insert_directory_statement.with_param_list(
-                        [name, parent + DIRECTORY_SEPARATOR] + path_components + padding
+                        [
+                            parent,
+                            [components[len(path)]],
+                            name,
+                        ]
                     )
                 )
             )
@@ -1834,11 +1852,6 @@ class _CassandraAccessor(bg_accessor.Accessor):
             return []
 
         components = self.__glob_parser.parse(glob)
-        if len(components) > _COMPONENTS_MAX_LEN:
-            raise bg_accessor.InvalidGlobError(
-                "Contains %d components, but we support %d at most"
-                % (len(components), _COMPONENTS_MAX_LEN)
-            )
 
         counter = None
         if self.__glob_parser.is_fully_defined(components):
@@ -1855,75 +1868,77 @@ class _CassandraAccessor(bg_accessor.Accessor):
             path = DIRECTORY_SEPARATOR.join([c[0] for c in components])
             queries = [query.bind([path])]
         else:
-            queries = self.metadata_query_generator.generate_queries(table, components)
             counter = SELECT
 
-        execution_requests = []
-        for query in queries:
-            if isinstance(query, six.string_types):
-                execution_request = _CassandraExecutionRequest(
-                    counter,
-                    c_query.SimpleStatement(query, consistency_level=self._meta_read_consistency)
+            parent = ''
+            pathes = ['.']
+            queries = []
+
+            components = glob.split('.')
+            component_no = 0
+
+            for component in components:
+                next_pathes = []
+
+                queries = []
+
+                for path in pathes:
+                    if table == "metrics" and component_no == len(components) - 1:
+                        query = self.__select_metric_statement_by_parent
+                        counter = SELECT_METRIC
+                    else:
+                        query = self.__select_directory_statement
+                        counter = SELECT_DIRECTORY
+                    queries.append(query.bind([path]))
+
+                # Prepare queries to retrieve pathes
+                execution_requests = []
+                for query in queries:
+                    execution_request = _CassandraExecutionRequest(counter, query)
+                    execution_requests.append(execution_request)
+
+                # Execute queries
+                query_results = self._execute_concurrent_metadata(
+                    execution_requests,
+                    concurrency=self.max_concurrent_queries_per_pattern,
+                    results_generator=True,
+                    raise_on_first_error=True,
                 )
-            else:
-                execution_request = _CassandraExecutionRequest(counter, query)
-            execution_requests.append(execution_request)
 
-        if self.cache:
-            # As queries can be statements, we use the string representation
-            # (which always contains the query and the parameters).
-            # WARNING: With the current code PrepareStatement would not be cached.
-            keys_to_queries = {
-                self.__query_key(ec.statement, ec.params): ec for ec in execution_requests
-            }
-            cached_results = self.cache.get_many(keys_to_queries.keys())
-            for key in cached_results:
-                execution_requests.remove(keys_to_queries[key])
-        else:
-            cached_results = {}
-
-        query_results = self._execute_concurrent_metadata(
-            execution_requests,
-            concurrency=self.max_concurrent_queries_per_pattern,
-            results_generator=True,
-            raise_on_first_error=True,
-        )
-
-        def _extract_results(query_results):
-            n_metrics = 0
-            fetched_results = collections.defaultdict(list)
-
-            too_many_metrics = TooManyMetrics(
-                "Query %s on %s yields more than %d results"
-                % (glob, table, self.max_metrics_per_pattern)
-            )
-
-            for _, names in cached_results.items():
-                for name in names:
-                    n_metrics += 1
-                    if n_metrics > self.max_metrics_per_pattern:
-                        raise too_many_metrics
-                    yield name
-
-            try:
                 for success, results in query_results:
-                    key = self.__query_key(results.response_future.query, None)
-                    # Make sure we also cache empty results.
-                    fetched_results[key] = []
                     for result in results:
-                        n_metrics += 1
-                        name = result[0]
-                        fetched_results[key].append(name)
-                        if n_metrics > self.max_metrics_per_pattern:
-                            raise too_many_metrics
-                        yield name
-            except cassandra.DriverException as e:
-                raise CassandraError("Failed to glob: %s on %s" % (table, glob), e)
+                        if table == "metrics" and component_no == len(components) - 1:
+                            name = result[2]
+                            subpathes = result[1]
+                        else:
+                            name = result[0]
+                            subpathes = result[1]
 
-            if self.cache and fetched_results:
-                self.cache.set_many(fetched_results, timeout=self.cache_metadata_ttl)
+                        if name != '.':
+                            path_component = name + '.' + component
+                        else:
+                            path_component = component
 
-        return _extract_results(query_results)
+                        glob_re = re.compile(bg_glob.glob_to_regex(path_component))
+
+                        for subpath in subpathes:
+                            # add the path to next
+                            if name == '.':
+                                next_path = subpath
+                            else:
+                                next_path = name + '.' + subpath
+
+                            # verify if subpath matches component
+                            if glob_re.match(next_path):
+                                next_pathes.append(next_path)
+
+                component_no += 1
+                pathes = next_pathes
+
+                if next_pathes == []:
+                    break
+
+        return pathes
 
     def background(self):
         """Perform periodic background operations."""
@@ -2044,10 +2059,12 @@ class _CassandraAccessor(bg_accessor.Accessor):
                 raise CassandraError("Missing keyspace '%s'." % self.keyspace_metadata)
 
             queries = _METADATA_CREATION_CQL
-            if self.use_lucene:
-                queries += _METADATA_CREATION_CQL_LUCENE
-            else:
-                queries += _METADATA_CREATION_CQL_SASI
+
+            # XXX Disabled
+            # if self.use_lucene:
+            #     queries += _METADATA_CREATION_CQL_LUCENE
+            # else:
+            #     queries += _METADATA_CREATION_CQL_SASI
 
             for cql in queries:
                 query = cql % {"keyspace": self.keyspace_metadata}
