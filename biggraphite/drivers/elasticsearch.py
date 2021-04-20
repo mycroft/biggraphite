@@ -844,6 +844,7 @@ class _ElasticSearchAccessor(bg_accessor.Accessor):
         callback_on_progress=None,
         disable_clean_directories=False,
         disable_clean_metrics=False,
+        disable_clean_broken_metrics=False,
     ):
         """See bg_accessor.Accessor."""
         super(_ElasticSearchAccessor, self).clean(

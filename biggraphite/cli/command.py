@@ -118,3 +118,7 @@ def add_clean_arguments(parser):
                         help="Disable cleaning outdated metrics",
                         action="store_true",
                         default=False)
+    parser.add_argument("--disable-clean-broken-metrics",
+                        help="Disable cleaning broken metrics",
+                        action="store_true",
+                        default=False)

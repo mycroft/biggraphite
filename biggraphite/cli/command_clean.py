@@ -153,6 +153,7 @@ class CommandClean(command.BaseCommand):
                 callback_on_progress=on_progress,
                 disable_clean_directories=opts.disable_clean_directories,
                 disable_clean_metrics=opts.disable_clean_metrics,
+                disable_clean_broken_metrics=opts.disable_clean_broken_metrics,
             )
 
         if opts.clean_corrupted:

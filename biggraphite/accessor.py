@@ -392,6 +392,7 @@ class Accessor(object):
         callback_on_progress=None,
         disable_clean_directories=False,
         disable_clean_metrics=False,
+        disable_clean_broken_metrics=False,
     ):
         """Remove metrics older than @max_age, considered to have expired (not used anymore)."""
         self._check_connected()

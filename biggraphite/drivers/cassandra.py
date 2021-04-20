@@ -130,6 +130,30 @@ PM_DELETED_DIRECTORIES = prometheus_client.Counter(
     "bg_cassandra_deleted_directories",
     "Number of directory that have been deleted so far",
 )
+CLEAN_BROKEN_METRICS_SELECT = prometheus_client.Counter(
+    "bg_cassandra_clean_broken_metrics_select",
+    "",
+)
+CLEAN_BROKEN_METRICS_DELETE_METRICS = prometheus_client.Counter(
+    "bg_cassandra_clean_broken_metrics_delete",
+    "",
+)
+CLEAN_BROKEN_METRICS_TO_CHECK = prometheus_client.Counter(
+    "bg_cassandra_clean_broken_metrics_to_check",
+    "",
+)
+BROKEN_METRIC_DELETED = prometheus_client.Counter(
+    "bg_cassandra_clean_broken_metrics_deleted",
+    "",
+)
+CLEAN_BROKEN_TO_REMOVE = prometheus_client.Counter(
+    "bg_cassandra_clean_broken_metrics_to_remove",
+    "",
+)
+CLEAN_BROKEN_METRICS = prometheus_client.Summary(
+    "bg_cassandra_clean_broken_metrics_latency_seconds",
+    ""
+)
 PM_REPAIRED_DIRECTORIES = prometheus_client.Counter(
     "bg_cassandra_repaired_directories", "Number of missing directory created"
 )
@@ -2348,6 +2372,114 @@ class _CassandraAccessor(bg_accessor.Accessor):
             if returned_rows == 0:
                 break
 
+    def map_broken_metrics_sync(
+        self,
+        callback,
+        start_key=None,
+        end_key=None,
+        shard=1,
+        nshards=0,
+        errback=None,
+        callback_on_progress=None,
+        num_token_ignore_on_error=DEFAULT_MAX_BATCH_UTIL,
+    ):
+        """Scan for broken metrics that does not contains any metrics_metadata.
+
+        This functions is only used for experimental statistical analysis.
+        It should be merged with the cleaning method to remove deduplicated code.
+        """
+        start_token, stop_token = self._get_search_range(
+            start_key, end_key, shard, nshards
+        )
+
+        # XXX TODO: replace DEFAULT_MAX_BATCH_UTIL by env.
+
+        select_metrics = self._prepare_background_request(
+            "SELECT name, token(name)"
+            ' FROM "%s".metrics'
+            " WHERE token(name) > ? LIMIT %d;"
+            % (self.keyspace_metadata, DEFAULT_MAX_BATCH_UTIL)
+        )
+
+        has_metric_query = self._prepare_background_request(
+            'SELECT name FROM "%s".metrics_metadata '
+            "WHERE name = ?"
+            % (self.keyspace_metadata,)
+        )
+
+        def metrics_to_check(result, stop_token):
+            for row in result:
+                name, next_token = row
+                if name and next_token < stop_token:
+                    yield _CassandraExecutionRequest(
+                        CLEAN_BROKEN_METRICS_TO_CHECK,
+                        has_metric_query,
+                        name,
+                    )
+
+        # Reset the error count.
+        ignored_errors = 0
+
+        log.info("Checking broken metrics")
+        token = start_token
+        while token < stop_token:
+            CLEAN_CURRENT_OFFSET.set(token)
+            try:
+                result = self._execute_metadata(
+                    CLEAN_BROKEN_METRICS,
+                    _CassandraExecutionRequest(
+                        CLEAN,
+                        select_metrics,
+                        int(token)
+                    ),
+                    timeout=DEFAULT_TIMEOUT_QUERY_UTIL
+                )
+
+                # Reset the error count.
+                ignored_errors = 0
+
+                # End was reached
+                if len(result.current_rows) == 0:
+                    break
+            except Exception as e:
+                log.exception("Got exception: %s at token %s" % (e, token))
+                # Put sleep a little bit to not stress Cassandra too mutch.
+                time.sleep(1)
+                ignored_errors += 1
+
+                # After a few retries on the same query, lets move on.
+                if ignored_errors % 3 == 0:
+                    token += num_token_ignore_on_error
+                    CLEAN_SKIPPED_OFFSET.inc(num_token_ignore_on_error)
+
+                # If we failed too much, let's just stop the process.
+                if ignored_errors > BATCH_MAX_IGNORED_ERRORS:
+                    break
+                continue
+
+            # Update token range for the next iteration
+            token = result[-1][1]
+
+            metrics = self._execute_concurrent_metadata(
+                metrics_to_check(result, stop_token),
+                concurrency=self.max_concurrent_connections,
+                raise_on_first_error=False,
+            )
+
+            for response in metrics:
+                if not response.success:
+                    print("failed to query for metrics in metrics_metadata")
+                    continue
+
+                name = response.result_or_exc.response_future.query.values[0]
+                name = str(name.decode('ascii'))
+                name = str(name).rpartition(".")[0]
+
+                callback(name, list(response.result_or_exc))
+
+            if callback_on_progress:
+                callback_on_progress(token - start_token, stop_token - start_token, token)
+
     def map_empty_directories_sync(
         self,
         callback,
@@ -2379,10 +2511,10 @@ class _CassandraAccessor(bg_accessor.Accessor):
             " WHERE parent LIKE ? LIMIT 1;" % (self.keyspace_metadata,)
         )
 
-        def directories_to_check(result):
+        def directories_to_check(result, stop_token):
             for row in result:
                 name, next_token = row
-                if name:
+                if name and next_token < stop_token:
                     yield _CassandraExecutionRequest(
                         CLEAN_DIRECTORIES_TO_CHECK,
                         has_metric_query,
@@ -2433,7 +2565,7 @@ class _CassandraAccessor(bg_accessor.Accessor):
             token = result[-1][1]
 
             parent_dirs = self._execute_concurrent_metadata(
-                directories_to_check(result),
+                directories_to_check(result, stop_token),
                 concurrency=self.max_concurrent_connections,
                 raise_on_first_error=False,
             )
@@ -2704,6 +2836,7 @@ class _CassandraAccessor(bg_accessor.Accessor):
         callback_on_progress=None,
         disable_clean_directories=False,
         disable_clean_metrics=False,
+        disable_clean_broken_metrics=False,
     ):
         """See bg_accessor.Accessor.
 
@@ -2751,6 +2884,15 @@ class _CassandraAccessor(bg_accessor.Accessor):
         else:
             log.info("Cleaning metrics was disabled")
 
+        if not disable_clean_broken_metrics:
+            self._clean_broken_metrics(
+                    start_key,
+                    end_key,
+                    shard,
+                    nshards,
+                    callback_on_progress,
+            )
+
         # Then, clean directories...
         if not disable_clean_directories:
             CLEAN_CURRENT_STEP.set(3)
@@ -2784,6 +2926,7 @@ class _CassandraAccessor(bg_accessor.Accessor):
         consistency=None,
     ):
         select = self.__session_metadata.prepare(query_str)
+
         if consistency is not None:
             select.consistency_level = consistency
         else:
@@ -2795,6 +2938,133 @@ class _CassandraAccessor(bg_accessor.Accessor):
         select.request_timeout = timeout
 
         return select
+
+    def _clean_broken_metrics(
+        self,
+        start_key=None,
+        end_key=None,
+        shard=1,
+        nshards=0,
+        callback_on_progress=None,
+    ):
+        """Scan metrics table & drop records without any metrics_metadata counterpart"""
+        start_token, stop_token = self._get_search_range(
+            start_key, end_key, shard, nshards
+        )
+
+        env_batch_size = environ.get('CLEAN_BATCH_SIZE')
+        if env_batch_size is not None and env_batch_size.isdigit():
+            batch_size = int(env_batch_size)
+        else:
+            batch_size = DEFAULT_MAX_BATCH_UTIL
+
+        select_metrics = self._prepare_background_request(
+            "SELECT name, token(name)"
+            ' FROM "%s".metrics'
+            " WHERE token(name) > ? LIMIT %d;"
+            % (self.keyspace_metadata, batch_size)
+        )
+
+        has_metric_query = self._prepare_background_request(
+            'SELECT name FROM "%s".metrics_metadata '
+            "WHERE name = ?"
+            % (self.keyspace_metadata,)
+        )
+
+        delete_metric = self._prepare_background_request(
+            'DELETE FROM "%s".metrics WHERE name = ? ;'
+            % (self.keyspace_metadata)
+        )
+
+        def metrics_to_check(result):
+            for row in result:
+                name, next_token = row
+                if name:
+                    yield _CassandraExecutionRequest(
+                        CLEAN_BROKEN_METRICS_TO_CHECK,
+                        has_metric_query,
+                        name
+                    )
+
+        def metrics_to_remove(result):
+            for response in result:
+                if not response.success:
+                    log.warning(str(response.result_or_exc))
+                    continue
+                results = list(response.result_or_exc)
+                if results:
+                    continue
+
+                name = response.result_or_exc.response_future.query.values[0]
+                name = str(name.decode('ascii'))
+
+                BROKEN_METRIC_DELETED.inc()
+
+                yield _CassandraExecutionRequest(
+                    CLEAN_BROKEN_TO_REMOVE,
+                    delete_metric,
+                    name
+                )
+
+        # Reset the error count.
+        ignored_errors = 0
+
+        log.info("Starting cleanup of broken metrics")
+        token = start_token
+        while token < stop_token:
+            CLEAN_CURRENT_OFFSET.set(token)
+            try:
+                result = self._execute_metadata(
+                    CLEAN_BROKEN_METRICS,
+                    _CassandraExecutionRequest(
+                        CLEAN,
+                        select_metrics,
+                        int(token)
+                    ),
+                    timeout=DEFAULT_TIMEOUT_QUERY_UTIL
+                )
+
+                # Reset the error count.
+                ignored_errors = 0
+
+                # End was reached
+                if len(result.current_rows) == 0:
+                    break
+
+            except Exception as e:
+                log.exception("Got exception: %s at token %s" % (e, token))
+                # Put sleep a little bit to not stress Cassandra too mutch.
+                time.sleep(1)
+                ignored_errors += 1
+
+                # After a few retries on the same query, lets move on.
+                if ignored_errors % 3 == 0:
+                    token += num_token_ignore_on_error
+                    CLEAN_SKIPPED_OFFSET.inc(num_token_ignore_on_error)
+
+                # If we failed too much, let's just stop the process.
+                if ignored_errors > BATCH_MAX_IGNORED_ERRORS:
+                    break
+                continue
+
+            # Update token range for the next iteration
+            token = result[-1][1]
+            broken_metrics = self._execute_concurrent_metadata(
+                metrics_to_check(result),
+                concurrency=self.max_concurrent_connections,
+                raise_on_first_error=False,
+            )
+            rets = self._execute_concurrent_metadata(
+                metrics_to_remove(broken_metrics),
+                concurrency=self.max_concurrent_connections,
+                raise_on_first_error=False,
+            )
+            for ret in rets:
+                if not ret.success:
+                    log.warning(str(ret.result_or_exc))
+
+            if callback_on_progress:
+                callback_on_progress(token - start_token, stop_token - start_token, token)
 
     def _clean_expired_metrics(
         self,

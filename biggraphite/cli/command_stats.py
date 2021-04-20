@@ -123,6 +123,9 @@ class CommandStats(command.BaseCommand):
         self._n_dir_count = 0
         self._n_dir_empty = 0
 
+        self._n_metrics_count = 0
+        self._n_metrics_missing_count = 0
+
         self.metrics_file_path = ""
 
     def add_arguments(self, parser):
@@ -176,6 +179,12 @@ class CommandStats(command.BaseCommand):
 
         self._n_count += 1
 
+    def statistical_analysis_stats_broken(self, metric, result):
+        self._n_metrics_count += 1
+
+        if len(result) == 0:
+            self._n_metrics_missing_count += 1
+
     def statistical_analysis_stats_directories(self, dir, result):
         """Aggregate stats for given directories."""
         if result == []:
@@ -204,6 +213,18 @@ class CommandStats(command.BaseCommand):
             'Total of expired metric found in offset ranges scanned',
             registry=registry)
         metric_total_expired.set(self._n_count_expired)
+
+        metric_comp_total = Gauge(
+            'metric_comp_total',
+            'Number of metric records in metrics table',
+            registry=registry)
+        metric_comp_total.set(self._n_metrics_count)
+
+        metric_comp_missing_total = Gauge(
+            'metric_comp_missing_total',
+            'Number of metric records in metrics table without metadata',
+            registry=registry)
+        metric_comp_total.set(self._n_metrics_missing_count)
 
         multiplier = 2**64 / self._n_range_size
 
@@ -264,25 +285,38 @@ class CommandStats(command.BaseCommand):
             start_offset = random.getrandbits(64) - 2**63
             self._n_range_size += range_size
 
-            # Scan metrics
+            print("Doing %d => %d" % (start_offset, start_offset + range_size))
+
+            # Scan metrics_metadata
             accessor.sync_map(
                 self.statistical_analysis_stats,
                 start_key=start_offset,
                 end_key=start_offset + range_size,
             )
 
-            # Scan directories
-            accessor.map_empty_directories_sync(
-                self.statistical_analysis_stats_directories,
+            # Scan metrics
+            accessor.map_broken_metrics_sync(
+                self.statistical_analysis_stats_broken,
                 start_key=start_offset,
                 end_key=start_offset + range_size,
             )
+
+            # Scan directories
+            #accessor.map_empty_directories_sync(
+            #    self.statistical_analysis_stats_directories,
+            #    start_key=start_offset,
+            #    end_key=start_offset + range_size,
+            #)
 
         print("Range: %d (%f%%)" % (self._n_range_size, self._n_range_size / 2**64))
         print("Metrics extrated: %d; Outdated: %d (%.2f%%)" % (
             self._n_count,
             self._n_count_expired,
             100 * self._n_count_expired / self._n_count))
+        print("Records in metrics: %d; Missing metadata: %d (%.2f%%)" %(
+            self._n_metrics_count,
+            self._n_metrics_missing_count,
+            100 * self._n_metrics_missing_count / self._n_metrics_count))
         multiplier = 2**64 / self._n_range_size
         print("Extrapolation: %d; Estimated outdated: %d" % (
             self._n_count * multiplier,
