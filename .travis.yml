@@ -28,6 +28,7 @@ env:
     - CASSANDRA_HOME="${TRAVIS_BUILD_DIR}/.deps/apache-cassandra-${CASSANDRA_VERSION}/"
     - ES_VERSION=6.3.1
     - ES_HOME="${TRAVIS_BUILD_DIR}/.deps/elasticsearch-${ES_VERSION}/"
+    - IS_ON_TRAVIS=1
 
 install:
   ### Java: We download now some dependencies to limit the number of messages later

@@ -30,7 +30,7 @@ from biggraphite.drivers import elasticsearch as bg_elasticsearch
 from biggraphite.metric import Aggregator, Retention, MetricMetadata
 from tests import test_utils as bg_test_utils
 from tests.drivers.base_test_metadata import BaseTestAccessorMetadata
-from tests.test_utils_elasticsearch import HAS_ELASTICSEARCH
+from tests.test_utils_elasticsearch import HAS_ELASTICSEARCH, IS_ON_TRAVIS
 
 
 class ComponentFromNameTest(unittest.TestCase):
@@ -342,6 +342,7 @@ class TestAccessorWithElasticsearch(
         self.assertEqual(expected_created_on, metric.created_on)
         self.assertEqual(expected_updated_on, metric.updated_on)
 
+    @unittest.skipUnless(not IS_ON_TRAVIS, "Skipped on travis")
     def test_metric_is_updated_after_ttl(self):
         with freezegun.freeze_time("2014-01-01 00:00:00"):
             metric = bg_test_utils.make_metric_with_defaults("foo")

@@ -26,6 +26,7 @@ import sys
 
 HAS_ES_HOME = bool(os.getenv("ES_HOME"))
 ES_HOSTPORT = os.getenv("ES_HOSTPORT")
+IS_ON_TRAVIS = bool(os.getenv("IS_ON_TRAVIS"))
 HAS_ELASTICSEARCH = HAS_ES_HOME or ES_HOSTPORT
 
 # Only try to import elasticsearch if we are going to use it. This is better
